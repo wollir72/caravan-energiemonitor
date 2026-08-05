@@ -1,0 +1,20 @@
+[victron]
+name = "SmartSolar HQ2444NCAFK"
+address = "F9:9F:71:BC:CC:D0"
+advertisement_key = "0123456789abcdef0123456789abcdef"
+
+[berger]
+enabled = true
+name = "Berger LiFePO4 200 Ah Pro"
+bluetooth_name = "11608062501619"
+address = "A5:C2:37:63:DC:37"
+capacity_ah = 200
+
+[solar]
+panel_count = 2
+panel_power_watts = 100
+installed_power_watts = 200
+
+[display]
+stale_after_seconds = 10
+maximum_solar_power = 250

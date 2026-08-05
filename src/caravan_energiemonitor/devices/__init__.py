@@ -1,0 +1,1 @@
+"""Manufacturer-specific device integrations."""
