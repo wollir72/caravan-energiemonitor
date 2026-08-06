@@ -3,7 +3,7 @@
 set -euo pipefail
 
 PROJECT_DIR="$HOME/devel/caravan-energiemonitor"
-VENV_DIR="$HOME/bin/venvs/victron"
+VENV_DIR="$HOME/bin/venvs/caravan-energiemonitor"
 APP="$VENV_DIR/bin/caravan-energiemonitor"
 
 if [[ ! -d "$PROJECT_DIR" ]]; then
