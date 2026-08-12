@@ -117,7 +117,7 @@ python -m compileall src
   BlueZ-/D-Bus-Berechtigungen und Instant Readout am Victron-Gerät voraus.
 - Der Status „Online“ bewertet den passiven Advertisement-Empfang, nicht eine
   aktive Verbindung (eine solche wird absichtlich nicht aufgebaut).
-- Version 0.1 zeigt den aktuellen Zustand; Verlaufsspeicherung und Diagramme
+- Version 0.2.0 zeigt den aktuellen Zustand; Verlaufsspeicherung und Diagramme
   sind nicht enthalten.
 - Die herstellerspezifischen Zusatzbytes der Berger-Basisantwort werden im
   Rohtelegramm erhalten, aber mangels verifizierter Bedeutung nicht als
