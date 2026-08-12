@@ -49,6 +49,10 @@ class _StopRequested(Exception):
     """Internal control-flow exception used to interrupt BLE operations."""
 
 
+class _HistoryPauseRequested(Exception):
+    """A safe discovery/connect boundary was interrupted for exclusive History."""
+
+
 class BergerWorker(QThread):
     """Find, connect and poll one Berger battery without changing BMS state."""
 
@@ -60,6 +64,8 @@ class BergerWorker(QThread):
     initial_connection_attempt_finished = Signal()
     measurement_window_requested = Signal()
     measurement_window_finished = Signal()
+    history_pause_changed = Signal(bool)
+    normal_operation_ready = Signal()
 
     def __init__(
         self, config: BergerConfig, parent: Any = None, poll_interval: float = 5.0
@@ -68,10 +74,14 @@ class BergerWorker(QThread):
         self._config = config
         self._poll_interval = poll_interval
         self._stop_requested = threading.Event()
+        self._history_pause_requested = threading.Event()
         self._loop: asyncio.AbstractEventLoop | None = None
         self._async_stop: asyncio.Event | None = None
         self._measurement_permission: asyncio.Event | None = None
         self._measurement_released: asyncio.Event | None = None
+        self._control_changed: asyncio.Event | None = None
+        self._normal_operation_permission: asyncio.Event | None = None
+        self._normal_resume_pending = threading.Event()
         self._assembler = FrameAssembler()
         self._responses: dict[int, asyncio.Future[bytes]] = {}
         self._rssi: int | None = None
@@ -95,10 +105,37 @@ class BergerWorker(QThread):
         """Thread-safe confirmation that Victron scanning is usable again."""
         self._set_async_event(self._measurement_released)
 
+    def request_history_pause(self) -> None:
+        """Finish the current frame, disconnect GATT, then confirm exclusivity."""
+        if self._stop_requested.is_set():
+            return
+        self._history_pause_requested.set()
+        if not self.isRunning():
+            self.history_pause_changed.emit(True)
+        self._set_async_event(self._control_changed)
+
+    def request_history_resume(self) -> None:
+        if self._stop_requested.is_set():
+            return
+        was_paused = self._history_pause_requested.is_set()
+        self._history_pause_requested.clear()
+        if was_paused:
+            self._normal_resume_pending.set()
+        if not self.isRunning():
+            self._normal_resume_pending.clear()
+            self.history_pause_changed.emit(False)
+            self.normal_operation_ready.emit()
+        self._set_async_event(self._control_changed)
+
+    def grant_normal_operation(self) -> None:
+        """Release a restored worker only after the BLE transition is safe."""
+        self._set_async_event(self._normal_operation_permission)
+
     def request_stop(self) -> None:
         """Request shutdown and wake every stop-aware async wait."""
         LOG.info("Stop für Berger-Worker angefordert")
         self._stop_requested.set()
+        self._history_pause_requested.set()
         loop = self._loop
         stop = self._async_stop
         if loop is not None and stop is not None:
@@ -115,6 +152,8 @@ class BergerWorker(QThread):
         self._async_stop = asyncio.Event()
         self._measurement_permission = asyncio.Event()
         self._measurement_released = asyncio.Event()
+        self._control_changed = asyncio.Event()
+        self._normal_operation_permission = asyncio.Event()
         try:
             loop.run_until_complete(self._run_reconnecting())
         except Exception as exc:  # defensive last-resort boundary for Qt thread
@@ -132,6 +171,8 @@ class BergerWorker(QThread):
             self._async_stop = None
             self._measurement_permission = None
             self._measurement_released = None
+            self._control_changed = None
+            self._normal_operation_permission = None
             self._loop = None
             LOG.info("Berger-Worker beendet")
 
@@ -146,22 +187,67 @@ class BergerWorker(QThread):
     async def _wait_or_stop(self, seconds: float) -> bool:
         """Wait without a busy loop; return true when shutdown was requested."""
         assert self._async_stop is not None
+        if self._control_changed is None:
+            self._control_changed = asyncio.Event()
+        self._control_changed.clear()
+        stop_task = asyncio.create_task(self._async_stop.wait())
+        control_task = asyncio.create_task(self._control_changed.wait())
         try:
-            await asyncio.wait_for(self._async_stop.wait(), timeout=seconds)
-        except TimeoutError:
-            return False
-        return True
+            done, _ = await asyncio.wait(
+                {stop_task, control_task}, timeout=seconds,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            return stop_task in done and stop_task.result()
+        finally:
+            for task in (stop_task, control_task):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(stop_task, control_task, return_exceptions=True)
+
+    async def _wait_while_history_paused(self) -> None:
+        assert self._async_stop is not None
+        assert self._control_changed is not None
+        self.history_pause_changed.emit(True)
+        LOG.info("Berger-GATT für Victron-History vollständig getrennt")
+        try:
+            while self._history_pause_requested.is_set() and not self._stop_requested.is_set():
+                self._control_changed.clear()
+                stop_task = asyncio.create_task(self._async_stop.wait())
+                control_task = asyncio.create_task(self._control_changed.wait())
+                done, pending = await asyncio.wait(
+                    {stop_task, control_task}, return_when=asyncio.FIRST_COMPLETED
+                )
+                for task in pending:
+                    task.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
+                if stop_task in done and stop_task.result():
+                    break
+        finally:
+            self.history_pause_changed.emit(False)
 
     async def _operation_or_stop(
-        self, awaitable: Awaitable[T], timeout: float, description: str
+        self,
+        awaitable: Awaitable[T],
+        timeout: float,
+        description: str,
+        *,
+        interrupt_for_history: bool = False,
     ) -> T:
         """Run one BLE operation until completion, timeout, or worker stop."""
         assert self._async_stop is not None
         operation = asyncio.ensure_future(awaitable)
         stop_task = asyncio.create_task(self._async_stop.wait())
+        pause_task = (
+            asyncio.create_task(self._wait_for_history_pause())
+            if interrupt_for_history
+            else None
+        )
         try:
+            waiters = {operation, stop_task}
+            if pause_task is not None:
+                waiters.add(pause_task)
             done, _ = await asyncio.wait(
-                {operation, stop_task},
+                waiters,
                 timeout=timeout,
                 return_when=asyncio.FIRST_COMPLETED,
             )
@@ -171,10 +257,59 @@ class BergerWorker(QThread):
             await asyncio.gather(operation, return_exceptions=True)
             if stop_task in done or self._stop_requested.is_set():
                 raise _StopRequested
+            if pause_task is not None and (
+                pause_task in done or self._history_pause_requested.is_set()
+            ):
+                raise _HistoryPauseRequested
             raise TimeoutError(f"Zeitüberschreitung bei {description}.")
         finally:
-            stop_task.cancel()
-            await asyncio.gather(stop_task, return_exceptions=True)
+            for task in (stop_task, pause_task):
+                if task is not None and not task.done():
+                    task.cancel()
+            await asyncio.gather(
+                *(task for task in (stop_task, pause_task) if task is not None),
+                return_exceptions=True,
+            )
+
+    async def _wait_for_history_pause(self) -> None:
+        assert self._control_changed is not None
+        while not self._history_pause_requested.is_set():
+            self._control_changed.clear()
+            if self._history_pause_requested.is_set():
+                break
+            await self._control_changed.wait()
+
+    async def _normal_operation_barrier(self) -> bool:
+        """Wait until the coordinator admits one post-History reconnect cycle."""
+        if not self._normal_resume_pending.is_set():
+            return True
+        assert self._async_stop is not None
+        assert self._normal_operation_permission is not None
+        self._normal_operation_permission.clear()
+        LOG.info("Berger-Restore wartet auf zentrale BLE-Freigabe")
+        self.normal_operation_ready.emit()
+        permission_task = asyncio.create_task(self._normal_operation_permission.wait())
+        stop_task = asyncio.create_task(self._async_stop.wait())
+        pause_task = asyncio.create_task(self._wait_for_history_pause())
+        try:
+            done, _ = await asyncio.wait(
+                {permission_task, stop_task, pause_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if stop_task in done or self._stop_requested.is_set():
+                raise _StopRequested
+            if pause_task in done or self._history_pause_requested.is_set():
+                return False
+            self._normal_resume_pending.clear()
+            LOG.info("Berger-Restore zentral freigegeben")
+            return True
+        finally:
+            for task in (permission_task, stop_task, pause_task):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(
+                permission_task, stop_task, pause_task, return_exceptions=True
+            )
 
     @staticmethod
     async def _bounded_cleanup(awaitable: Awaitable[Any], description: str) -> None:
@@ -215,6 +350,9 @@ class BergerWorker(QThread):
         backoff = INITIAL_BACKOFF
         attempt = 0
         while not self._stop_requested.is_set():
+            if self._history_pause_requested.is_set():
+                await self._wait_while_history_paused()
+                continue
             attempt += 1
             self._connected_in_attempt = False
             self._snapshot_received_in_attempt = False
@@ -227,10 +365,15 @@ class BergerWorker(QThread):
                     raise TimeoutError(
                         f"Berger-Batterie {self._config.address} nicht gefunden."
                     )
+                if self._history_pause_requested.is_set():
+                    continue
                 await self._connected_session(device)
                 backoff = INITIAL_BACKOFF
             except _StopRequested:
                 break
+            except _HistoryPauseRequested:
+                LOG.info("Berger-Reconnect vor History kontrolliert gestoppt")
+                continue
             except asyncio.CancelledError:
                 raise
             except (BleakError, TimeoutError, ConnectionError, BergerProtocolError) as exc:
@@ -252,6 +395,14 @@ class BergerWorker(QThread):
 
             if self._stop_requested.is_set():
                 break
+            if self._history_pause_requested.is_set():
+                continue
+            if self._normal_resume_pending.is_set():
+                try:
+                    if not await self._normal_operation_barrier():
+                        continue
+                except _StopRequested:
+                    break
             LOG.info("Berger-Reconnect in %.1f Sekunden", backoff)
             if await self._wait_or_stop(backoff):
                 break
@@ -271,20 +422,26 @@ class BergerWorker(QThread):
                 found.set_result(device)
 
         scanner = BleakScanner(detection_callback=detection_callback)
-        started = False
+        start_attempted = False
         LOG.info("Berger-Scan beginnt (%s)", self._config.address)
         try:
+            start_attempted = True
             await self._operation_or_stop(
-                scanner.start(), CONNECT_TIMEOUT, "Start des Berger-Scans"
+                scanner.start(),
+                CONNECT_TIMEOUT,
+                "Start des Berger-Scans",
+                interrupt_for_history=True,
             )
-            started = True
             return await self._operation_or_stop(
-                found, SCAN_TIMEOUT, "Berger-Gerätesuche"
+                found,
+                SCAN_TIMEOUT,
+                "Berger-Gerätesuche",
+                interrupt_for_history=True,
             )
         finally:
             if not found.done():
                 found.cancel()
-            if started:
+            if start_attempted:
                 await self._bounded_cleanup(scanner.stop(), "Berger-Scan stoppen")
             LOG.info("Berger-Scan beendet")
 
@@ -308,7 +465,10 @@ class BergerWorker(QThread):
         try:
             LOG.info("Berger-Verbindung wird aufgebaut (%s)", device.address)
             await self._operation_or_stop(
-                client.connect(), CONNECT_TIMEOUT, "Berger-Verbindungsaufbau"
+                client.connect(),
+                CONNECT_TIMEOUT,
+                "Berger-Verbindungsaufbau",
+                interrupt_for_history=True,
             )
             if not client.is_connected:
                 raise ConnectionError("Berger-Verbindung wurde nicht hergestellt.")
@@ -324,9 +484,15 @@ class BergerWorker(QThread):
                 "Start der Berger-Notifications",
             )
             notifications_started = True
+            if not await self._normal_operation_barrier():
+                raise _HistoryPauseRequested
 
             failed_measurement_windows = 0
-            while not self._stop_requested.is_set() and client.is_connected:
+            while (
+                not self._stop_requested.is_set()
+                and not self._history_pause_requested.is_set()
+                and client.is_connected
+            ):
                 self.worker_heartbeat.emit()
                 try:
                     await self._measurement_cycle(client, device)
@@ -406,6 +572,8 @@ class BergerWorker(QThread):
             basic_frame = await self._request_with_retry(
                 client, BASIC_REGISTER, BASIC_INFO_COMMAND
             )
+            if self._history_pause_requested.is_set():
+                raise _HistoryPauseRequested
             cell_frame = await self._request_with_retry(
                 client, CELL_REGISTER, CELL_VOLTAGES_COMMAND
             )

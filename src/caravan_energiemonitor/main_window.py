@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import logging
 import time
+from datetime import datetime
 
 from PySide6.QtCore import QThread, QTimer, Qt
-from PySide6.QtGui import QCloseEvent
+from PySide6.QtGui import QCloseEvent, QColor, QPalette
 from PySide6.QtWidgets import (
     QFrame,
     QGridLayout,
@@ -12,18 +13,23 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QMainWindow,
+    QStackedWidget,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
 
 from .config import AppConfig
-from .ble_coordinator import BleCoordinator
+from .ble_coordinator import BleCoordinator, BleMode
 from caravan_energiemonitor.devices.berger.worker import BergerWorker
 from caravan_energiemonitor.devices.victron.worker import VictronWorker
+from caravan_energiemonitor.devices.victron.history_worker import VictronHistoryWorker
 from .models import (
     BatterySnapshot,
     SolarSnapshot,
     StatusTracker,
+    VictronHistoryDay,
+    VictronHistorySummary,
     format_capacity,
     format_cell_delta,
     format_cell_voltage,
@@ -38,6 +44,7 @@ from .models import (
     format_voltage,
     format_yield,
 )
+from .widgets.history_view import VictronHistoryView
 from .widgets.power_gauge import PowerGauge
 from .widgets.value_card import ValueCard
 
@@ -58,6 +65,11 @@ class MainWindow(QMainWindow):
         self._victron_started = False
         self._victron_start_deferred = False
         self._ble_coordinator: BleCoordinator | None = None
+        self._history_worker: VictronHistoryWorker | None = None
+        self._history_result_received = False
+        self.history_cache: tuple[
+            VictronHistorySummary, tuple[VictronHistoryDay, ...], datetime
+        ] | None = None
         self._cards: dict[str, ValueCard] = {}
         self._build_ui()
 
@@ -84,12 +96,16 @@ class MainWindow(QMainWindow):
             self.berger_worker.connection_state_changed.connect(
                 self._on_berger_connection_state
             )
-            self._ble_coordinator = BleCoordinator(
-                self.worker, self.berger_worker, self
-            )
             self.berger_worker.measurement_window_finished.connect(
                 self._on_initial_measurement_window_finished
             )
+
+        self._ble_coordinator = BleCoordinator(self.worker, self.berger_worker, self)
+        self._ble_coordinator.history_access_granted.connect(
+            self._on_history_access_granted
+        )
+        self._ble_coordinator.mode_changed.connect(self._on_ble_mode_changed)
+        if self.berger_worker is not None:
             self._last_berger_heartbeat = time.monotonic()
             LOG.info("Starte Berger vor dem Victron-Scanner und warte auf Snapshot")
             self._victron_start_timer.start()
@@ -106,6 +122,9 @@ class MainWindow(QMainWindow):
     def _start_victron_worker(self) -> None:
         """Open the startup gate after Berger's first complete snapshot."""
         if self._closing or self._victron_started:
+            return
+        if self.victron_tabs.currentIndex() != 0:
+            self._victron_start_deferred = True
             return
         self._victron_start_timer.stop()
         self._victron_start_deferred = False
@@ -198,17 +217,129 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(column)
         layout.setContentsMargins(10, 14, 10, 10)
         layout.setSpacing(8)
-        layout.addWidget(
-            self._device_header(
-                self.config.victron.name, self.victron_status_label
-            )
+        self.victron_tabs = QTabWidget()
+        self.victron_tabs.setObjectName("victronTabs")
+        self.victron_tabs.setStyleSheet(
+            "QTabWidget#victronTabs::pane { background-color: palette(window); }"
         )
-
-        layout.addWidget(self.gauge, 1)
-        layout.addWidget(self._solar_group())
-        layout.addWidget(self._victron_battery_group())
-        layout.addWidget(self._victron_device_group())
+        status_page = QWidget()
+        status_page.setObjectName("victronStatusPage")
+        status_layout = QVBoxLayout(status_page)
+        status_layout.setContentsMargins(2, 2, 2, 2)
+        status_layout.setSpacing(8)
+        status_layout.addWidget(
+            self._device_header(self.config.victron.name, self.victron_status_label)
+        )
+        status_layout.addWidget(self.gauge, 1)
+        status_layout.addWidget(self._solar_group())
+        status_layout.addWidget(self._victron_battery_group())
+        status_layout.addWidget(self._victron_device_group())
+        self.history_view = VictronHistoryView()
+        self.history_view.setObjectName("victronHistoryPage")
+        self.history_view.refresh_requested.connect(self._refresh_history)
+        self.victron_tabs.addTab(status_page, "Status")
+        self.victron_tabs.addTab(self.history_view, "Verlauf")
+        background = column.palette().color(QPalette.ColorRole.Window)
+        self._set_victron_background(self.victron_tabs, background)
+        self._set_victron_background(status_page, background)
+        self.history_view.set_content_background(background)
+        tab_stack = self.victron_tabs.findChild(QStackedWidget)
+        if tab_stack is not None:
+            self._set_victron_background(tab_stack, background)
+        self.victron_tabs.setCurrentIndex(0)
+        self.victron_tabs.currentChanged.connect(self._on_victron_tab_changed)
+        layout.addWidget(self.victron_tabs, 1)
         return column
+
+    @staticmethod
+    def _set_victron_background(widget: QWidget, color: QColor) -> None:
+        """Use the app's window color only inside the Victron tab container."""
+        palette = widget.palette()
+        palette.setColor(QPalette.ColorRole.Window, color)
+        widget.setPalette(palette)
+        widget.setAutoFillBackground(True)
+
+    def _on_victron_tab_changed(self, index: int) -> None:
+        if self._closing or self._ble_coordinator is None:
+            return
+        if index == 0:
+            if self._history_worker is not None and self._history_worker.isRunning():
+                self._history_worker.request_cancel()
+            self._ble_coordinator.request_status()
+            return
+        if self.history_cache is not None:
+            summary, days, updated_at = self.history_cache
+            self.history_view.show_history(summary, days, updated_at)
+            self._ble_coordinator.show_cached_history()
+            return
+        self._begin_history_load()
+
+    def _refresh_history(self) -> None:
+        if self._history_worker is not None and self._history_worker.isRunning():
+            return
+        self._begin_history_load()
+
+    def _begin_history_load(self) -> None:
+        if self._ble_coordinator is None:
+            self.history_view.show_error("Berger/BLE-Koordination ist nicht verfügbar.")
+            return
+        self.history_view.set_loading()
+        if not self._ble_coordinator.begin_history():
+            return
+
+    def _on_history_access_granted(self) -> None:
+        if self._closing:
+            return
+        if self.victron_tabs.currentIndex() == 0:
+            assert self._ble_coordinator is not None
+            self._ble_coordinator.finish_history(False)
+            return
+        if self._history_worker is not None and self._history_worker.isRunning():
+            return
+        worker = VictronHistoryWorker(self.config.victron, self)
+        self._history_worker = worker
+        self._history_result_received = False
+        worker.progress_changed.connect(self.history_view.set_progress)
+        worker.history_received.connect(self._on_history_received)
+        worker.error_occurred.connect(self._on_history_error)
+        worker.cancelled.connect(self._on_history_cancelled)
+        worker.finished.connect(self._on_history_worker_finished)
+        worker.start()
+
+    def _on_history_received(
+        self,
+        summary: VictronHistorySummary,
+        days: tuple[VictronHistoryDay, ...],
+    ) -> None:
+        updated_at = datetime.now()
+        self.history_cache = (summary, days, updated_at)
+        self._history_result_received = True
+        if self.victron_tabs.currentIndex() == 1:
+            self.history_view.show_history(summary, days, updated_at)
+            self.history_view.refresh_button.setEnabled(False)
+
+    def _on_history_error(self, message: str) -> None:
+        self._history_result_received = False
+        if self.victron_tabs.currentIndex() == 1:
+            self.history_view.show_error(message)
+            self.history_view.refresh_button.setEnabled(False)
+
+    def _on_history_cancelled(self) -> None:
+        self._history_result_received = False
+
+    def _on_history_worker_finished(self) -> None:
+        worker = self._history_worker
+        self._history_worker = None
+        if self._ble_coordinator is not None:
+            self._ble_coordinator.finish_history(self._history_result_received)
+        if self.victron_tabs.currentIndex() == 1:
+            self.history_view.refresh_button.setEnabled(True)
+        if worker is not None:
+            worker.deleteLater()
+
+    def _on_ble_mode_changed(self, mode: BleMode) -> None:
+        if mode is BleMode.STATUS and self._victron_start_deferred:
+            self._start_victron_worker()
 
     def _berger_column(self) -> QGroupBox:
         column = QGroupBox("Batterie")
@@ -541,6 +672,8 @@ class MainWindow(QMainWindow):
         workers: list[QThread] = [self.worker]
         if self.berger_worker is not None:
             workers.append(self.berger_worker)
+        if self._history_worker is not None:
+            workers.append(self._history_worker)
 
         # Stop both first; never let waiting for one delay the other's request.
         for worker in workers:

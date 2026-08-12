@@ -32,6 +32,8 @@ def run_worker_test(scenario):
         worker._async_stop = asyncio.Event()
         worker._measurement_permission = asyncio.Event()
         worker._measurement_released = asyncio.Event()
+        worker._control_changed = asyncio.Event()
+        worker._normal_operation_permission = asyncio.Event()
         await scenario(worker)
 
     asyncio.run(run())
@@ -333,5 +335,150 @@ def test_hanging_disconnect_finishes_within_cleanup_bound(monkeypatch):
         started = time.monotonic()
         await worker._disconnect_client(Client())
         assert time.monotonic() - started < 0.2
+
+    run_worker_test(scenario)
+
+
+def test_history_pause_interrupts_discovery_and_stops_scanner_once(monkeypatch):
+    async def scenario(worker):
+        created = asyncio.Event()
+
+        class FakeScanner:
+            instance = None
+
+            def __init__(self, **_kwargs):
+                self.started = asyncio.Event()
+                self.start_calls = 0
+                self.stop_calls = 0
+                type(self).instance = self
+                created.set()
+
+            async def start(self):
+                self.start_calls += 1
+                self.started.set()
+
+            async def stop(self):
+                self.stop_calls += 1
+
+        monkeypatch.setattr(worker_module, "BleakScanner", FakeScanner)
+        task = asyncio.create_task(worker._find_device())
+        await created.wait()
+        scanner = FakeScanner.instance
+        await scanner.started.wait()
+        worker._history_pause_requested.set()
+        worker._control_changed.set()
+        with pytest.raises(worker_module._HistoryPauseRequested):
+            await task
+        assert scanner.start_calls == 1
+        assert scanner.stop_calls == 1
+
+    run_worker_test(scenario)
+
+
+def test_history_pause_during_scanner_start_still_runs_scanner_cleanup(monkeypatch):
+    async def scenario(worker):
+        start_entered = asyncio.Event()
+        release_start = asyncio.Event()
+
+        class FakeScanner:
+            instance = None
+
+            def __init__(self, **_kwargs):
+                self.stop_calls = 0
+                type(self).instance = self
+
+            async def start(self):
+                start_entered.set()
+                await release_start.wait()
+
+            async def stop(self):
+                self.stop_calls += 1
+
+        monkeypatch.setattr(worker_module, "BleakScanner", FakeScanner)
+        task = asyncio.create_task(worker._find_device())
+        await start_entered.wait()
+        worker._history_pause_requested.set()
+        worker._control_changed.set()
+        with pytest.raises(worker_module._HistoryPauseRequested):
+            await task
+        assert FakeScanner.instance.stop_calls == 1
+
+    run_worker_test(scenario)
+
+
+def test_shutdown_during_berger_discovery_stops_scanner_and_finishes(monkeypatch):
+    async def scenario(worker):
+        scan_started = asyncio.Event()
+
+        class FakeScanner:
+            instance = None
+
+            def __init__(self, **_kwargs):
+                self.stop_calls = 0
+                type(self).instance = self
+
+            async def start(self):
+                scan_started.set()
+
+            async def stop(self):
+                self.stop_calls += 1
+
+        monkeypatch.setattr(worker_module, "BleakScanner", FakeScanner)
+        task = asyncio.create_task(worker._run_reconnecting())
+        await scan_started.wait()
+        worker.request_stop()
+        await task
+        assert FakeScanner.instance.stop_calls == 1
+
+    run_worker_test(scenario)
+
+
+def test_restore_barrier_prevents_reconnect_until_coordinator_grants():
+    async def scenario(worker):
+        scans = 0
+        ready = asyncio.Event()
+        worker.normal_operation_ready.connect(ready.set)
+        worker._normal_resume_pending.set()
+
+        async def find_device(self):
+            nonlocal scans
+            scans += 1
+            return None
+
+        async def wait_or_stop(self, _seconds):
+            self._stop_requested.set()
+            return True
+
+        worker._find_device = MethodType(find_device, worker)
+        worker._wait_or_stop = MethodType(wait_or_stop, worker)
+        task = asyncio.create_task(worker._run_reconnecting())
+        assert scans == 0
+        await ready.wait()
+        assert scans == 1
+        worker.grant_normal_operation()
+        await task
+        assert scans == 1
+
+    run_worker_test(scenario)
+
+
+def test_history_pause_between_03_and_04_skips_cell_read():
+    async def scenario(worker):
+        registers = []
+        worker.measurement_window_requested.connect(worker.grant_measurement_permission)
+        worker.measurement_window_finished.connect(
+            worker.confirm_measurement_window_finished
+        )
+
+        async def request_with_retry(self, _client, register, _command):
+            registers.append(register)
+            if register == worker_module.BASIC_REGISTER:
+                self._history_pause_requested.set()
+            return b"frame"
+
+        worker._request_with_retry = MethodType(request_with_retry, worker)
+        with pytest.raises(worker_module._HistoryPauseRequested):
+            await worker._measurement_cycle(object(), SimpleNamespace(address="test"))
+        assert registers == [worker_module.BASIC_REGISTER]
 
     run_worker_test(scenario)

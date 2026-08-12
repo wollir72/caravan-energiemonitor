@@ -257,3 +257,36 @@ def test_shutdown_does_not_resume_paused_active_scan():
         assert active.start_calls == 1
 
     asyncio.run(scenario())
+
+
+def test_exclusive_history_pause_stops_and_resumes_passive_scan():
+    async def scenario():
+        worker = make_async_worker()
+        started = asyncio.Event()
+        paused = asyncio.Event()
+        resumed = asyncio.Event()
+        worker.exclusive_pause_changed.connect(
+            lambda value: paused.set() if value else resumed.set()
+        )
+        passive = FakeScanner(on_start=started.set)
+        worker._new_scanner = lambda *, passive: passive_scanner
+        passive_scanner = passive
+        task = asyncio.create_task(worker._scan())
+        await asyncio.wait_for(started.wait(), timeout=0.2)
+
+        worker._exclusive_pause_requested.set()
+        worker._wake_scan_loop()
+        await asyncio.wait_for(paused.wait(), timeout=0.2)
+        assert passive.stop_calls == 1
+        assert worker.scan_mode == "stopped"
+
+        worker._exclusive_pause_requested.clear()
+        worker._wake_scan_loop()
+        await asyncio.wait_for(resumed.wait(), timeout=0.2)
+        assert passive.start_calls == 2
+        assert worker.scan_mode == "passive"
+
+        worker.request_stop()
+        await asyncio.wait_for(task, timeout=0.2)
+
+    asyncio.run(scenario())

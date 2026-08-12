@@ -170,12 +170,14 @@ class VictronWorker(QThread):
     scan_paused = Signal()
     scan_resumed = Signal()
     scan_mode_changed = Signal(str)
+    exclusive_pause_changed = Signal(bool)
 
     def __init__(self, config: VictronConfig, parent=None) -> None:
         super().__init__(parent)
         self._config = config
         self._stop_requested = threading.Event()
         self._pause_requested = threading.Event()
+        self._exclusive_pause_requested = threading.Event()
         self._loop: asyncio.AbstractEventLoop | None = None
         self._async_stop: asyncio.Event | None = None
         self._scan_command: asyncio.Event | None = None
@@ -217,10 +219,29 @@ class VictronWorker(QThread):
         self._pause_requested.clear()
         self._wake_scan_loop()
 
+    def request_exclusive_pause(self) -> None:
+        """Stop either scan mode and confirm that no scanner remains active."""
+        if self._stop_requested.is_set():
+            return
+        already_requested = self._exclusive_pause_requested.is_set()
+        self._exclusive_pause_requested.set()
+        if not self.isRunning() or (already_requested and self.scan_mode == "stopped"):
+            self.exclusive_pause_changed.emit(True)
+        self._wake_scan_loop()
+
+    def request_exclusive_resume(self) -> None:
+        if self._stop_requested.is_set():
+            return
+        self._exclusive_pause_requested.clear()
+        if not self.isRunning():
+            self.exclusive_pause_changed.emit(False)
+        self._wake_scan_loop()
+
     def request_stop(self) -> None:
         LOG.info("Stop für Victron-Worker angefordert")
         self._stop_requested.set()
         self._pause_requested.set()
+        self._exclusive_pause_requested.set()
         loop = self._loop
         stop = self._async_stop
         if loop is not None and stop is not None:
@@ -308,6 +329,7 @@ class VictronWorker(QThread):
         scanner = self._new_scanner(passive=True)
         started = False
         paused = False
+        exclusively_paused = False
         scan_mode = "passiv"
         try:
             LOG.info("Passiver Victron-Scan wird versucht (%s)", self._config.address)
@@ -341,7 +363,33 @@ class VictronWorker(QThread):
             assert self._scan_command is not None
             while not self._async_stop.is_set():
                 self._scan_command.clear()
-                if scan_mode == "aktiv" and self._pause_requested.is_set() and not paused:
+                if self._exclusive_pause_requested.is_set() and not exclusively_paused:
+                    LOG.info("Victron-Scan wird für exklusiven GATT-Zugriff gestoppt")
+                    if started:
+                        await self._operation_or_stop(
+                            scanner.stop(),
+                            BLE_CLEANUP_TIMEOUT,
+                            "Stoppen des Victron-Scans für History",
+                        )
+                        started = False
+                    paused = False
+                    exclusively_paused = True
+                    self._set_scan_mode("stopped")
+                    self.exclusive_pause_changed.emit(True)
+                elif exclusively_paused and not self._exclusive_pause_requested.is_set():
+                    LOG.info("Victron-Scan wird nach exklusivem GATT-Zugriff fortgesetzt")
+                    await self._operation_or_stop(
+                        scanner.start(),
+                        BLE_OPERATION_TIMEOUT,
+                        "Fortsetzen des Victron-Scans nach History",
+                    )
+                    started = True
+                    exclusively_paused = False
+                    self._set_scan_mode("active" if scan_mode == "aktiv" else "passive")
+                    self.exclusive_pause_changed.emit(False)
+                elif exclusively_paused:
+                    pass
+                elif scan_mode == "aktiv" and self._pause_requested.is_set() and not paused:
                     LOG.info("Aktiver Victron-Scan wird pausiert")
                     await self._operation_or_stop(
                         scanner.stop(),
@@ -378,5 +426,7 @@ class VictronWorker(QThread):
         finally:
             if started:
                 await self._bounded_cleanup(scanner.stop())
+            if exclusively_paused:
+                self.exclusive_pause_changed.emit(False)
             self._set_scan_mode("stopped")
             LOG.info("Victron-Scan beendet (Modus: %s)", scan_mode)

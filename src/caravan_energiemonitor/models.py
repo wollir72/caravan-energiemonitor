@@ -55,6 +55,38 @@ class BatterySnapshot:
     raw_cell_response: bytes | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class VictronHistorySummary:
+    """Immutable, transport-independent SmartSolar history metadata."""
+
+    days_available: int
+    yield_since_reset_kwh: float
+    lifetime_yield_kwh: float
+    max_pv_voltage_v: float
+    max_battery_voltage_v: float
+    min_battery_voltage_v: float | None
+    error_history: tuple[int, int, int, int]
+
+
+@dataclass(frozen=True, slots=True)
+class VictronHistoryDay:
+    """One immutable daily SmartSolar history record."""
+
+    day_index: int
+    sequence_number: int
+    yield_kwh: float
+    load_consumption_kwh: float | None
+    battery_voltage_max_v: float
+    battery_voltage_min_v: float
+    errors: tuple[int, int, int, int]
+    bulk_minutes: int
+    absorption_minutes: int
+    float_minutes: int
+    max_pv_power_w: int
+    max_battery_current_a: float
+    max_pv_voltage_v: float
+
+
 class MonitorStatus(Enum):
     WAITING = "Warte auf Bluetooth-Daten"
     ONLINE = "Online"
