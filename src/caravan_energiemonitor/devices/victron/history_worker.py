@@ -83,6 +83,7 @@ class VictronHistoryWorker(QThread):
                 pass
 
     def run(self) -> None:
+        LOG.info("Victron-History-Worker gestartet (%s)", self._config.address)
         self.loading_started.emit()
         loop = asyncio.new_event_loop()
         self._loop = loop
@@ -111,6 +112,8 @@ class VictronHistoryWorker(QThread):
             loop.close()
             self._main_task = None
             self._loop = None
+            LOG.info("Victron-History-GATT beendet")
+            LOG.info("Victron-History-Worker beendet")
 
     @staticmethod
     async def _bounded(awaitable: Awaitable[T], timeout: float, label: str) -> T:
@@ -175,6 +178,7 @@ class VictronHistoryWorker(QThread):
                 await self._send(client, flow, FLOW_KEEPALIVE, "Keepalive F9 41")
 
     async def _read_history(self) -> None:
+        LOG.info("Victron-History-GATT gestartet")
         if self._cancel_requested.is_set():
             raise _Cancelled
         device = await self._bounded(
@@ -237,6 +241,7 @@ class VictronHistoryWorker(QThread):
                 self.progress_changed.emit(index + 1, len(registers))
             self.history_received.emit(summary, tuple(days))
         finally:
+            LOG.info("Victron-GATT-Cleanup gestartet")
             if keepalive_task is not None:
                 keepalive_task.cancel()
                 await asyncio.gather(keepalive_task, return_exceptions=True)
@@ -252,4 +257,4 @@ class VictronHistoryWorker(QThread):
                 except Exception:
                     LOG.warning("Victron-GATT-Disconnect konnte nicht bestätigt werden", exc_info=True)
             self.gatt_state_changed.emit(False)
-            LOG.info("Victron-GATT-Verbindung beendet")
+            LOG.info("Victron-GATT-Cleanup beendet")

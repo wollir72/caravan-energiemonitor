@@ -1,19 +1,17 @@
 from __future__ import annotations
 
-import logging
 from pathlib import Path
 import sys
 
 from PySide6.QtWidgets import QApplication, QMessageBox
 
 from .config import ConfigError, load_config
+from .logging_config import configure_logging, log_startup
 
 
 def main() -> int:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
+    log_path = configure_logging()
+    log_startup(log_path)
     app = QApplication(sys.argv)
     app.setApplicationName("Caravan-Energiemonitor")
     app.setOrganizationName("Caravan-Energiemonitor")

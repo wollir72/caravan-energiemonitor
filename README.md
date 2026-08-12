@@ -67,6 +67,21 @@ caravan-energiemonitor
 
 Die Anwendung erwartet `config.toml` im aktuellen Arbeitsverzeichnis.
 
+## Logdatei
+
+Unter Linux schreibt die Anwendung Laufzeitmeldungen zusätzlich zum Terminal in
+`~/.local/state/caravan-energiemonitor/caravan-energiemonitor.log`. Wenn
+`XDG_STATE_HOME` gesetzt ist, wird stattdessen
+`$XDG_STATE_HOME/caravan-energiemonitor/caravan-energiemonitor.log` verwendet.
+Die Datei rotiert automatisch.
+
+Die letzten Meldungen beziehungsweise neue Meldungen in Echtzeit zeigt man mit:
+
+```bash
+tail -n 200 ~/.local/state/caravan-energiemonitor/caravan-energiemonitor.log
+tail -f ~/.local/state/caravan-energiemonitor/caravan-energiemonitor.log
+```
+
 ## Architektur und Status
 
 `SmartSolarScanner` ist eine eigene Unterklasse von

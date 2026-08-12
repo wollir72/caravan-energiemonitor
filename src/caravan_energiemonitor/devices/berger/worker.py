@@ -88,6 +88,7 @@ class BergerWorker(QThread):
         self._initial_attempt_reported = False
         self._connected_in_attempt = False
         self._snapshot_received_in_attempt = False
+        self._connection_attempt = 0
 
     def _set_async_event(self, event: asyncio.Event | None) -> None:
         loop = self._loop
@@ -158,7 +159,7 @@ class BergerWorker(QThread):
             loop.run_until_complete(self._run_reconnecting())
         except Exception as exc:  # defensive last-resort boundary for Qt thread
             message = f"Berger-Bluetooth konnte nicht gestartet werden: {exc}"
-            LOG.exception(message)
+            LOG.exception("Berger-Worker endgültig abgebrochen: %s", message)
             self.bluetooth_error.emit(message)
         finally:
             self._report_initial_attempt_finished()
@@ -174,7 +175,10 @@ class BergerWorker(QThread):
             self._control_changed = None
             self._normal_operation_permission = None
             self._loop = None
-            LOG.info("Berger-Worker beendet")
+            if self._stop_requested.is_set():
+                LOG.info("Berger-Worker Shutdown abgeschlossen")
+            else:
+                LOG.info("Berger-Worker beendet")
 
     def _report_initial_attempt_finished(self) -> None:
         """Emit the startup gate exactly once, on both success and failure."""
@@ -354,6 +358,7 @@ class BergerWorker(QThread):
                 await self._wait_while_history_paused()
                 continue
             attempt += 1
+            self._connection_attempt = attempt
             self._connected_in_attempt = False
             self._snapshot_received_in_attempt = False
             self.worker_heartbeat.emit()
@@ -476,6 +481,11 @@ class BergerWorker(QThread):
             self._connected_in_attempt = True
             self.connection_state_changed.emit(True)
             LOG.info("Berger-Verbindung hergestellt (%s)", device.address)
+            if self._connection_attempt > 1:
+                LOG.info(
+                    "Berger-Reconnect erfolgreich (Versuch %d)",
+                    self._connection_attempt,
+                )
             self._report_initial_attempt_finished()
 
             await self._operation_or_stop(
@@ -552,7 +562,7 @@ class BergerWorker(QThread):
                 disconnect_expected = True
                 await self._disconnect_client(client)
             if connected:
-                LOG.info("Berger-Verbindung beendet (%s)", device.address)
+                LOG.info("Berger-GATT getrennt (%s)", device.address)
 
     async def _measurement_cycle(self, client, device) -> None:
         """Read both registers inside one centrally coordinated radio window."""
@@ -569,6 +579,7 @@ class BergerWorker(QThread):
                 MEASUREMENT_WINDOW_TIMEOUT,
                 "Freigabe des Berger-Messfensters",
             )
+            LOG.info("Berger-Messfenster gestartet")
             basic_frame = await self._request_with_retry(
                 client, BASIC_REGISTER, BASIC_INFO_COMMAND
             )
@@ -609,41 +620,50 @@ class BergerWorker(QThread):
             return await self._request(client, register, command)
 
     def _emit_snapshot(self, device, basic_frame: bytes, cell_frame: bytes) -> None:
-        basic = parse_basic_response(basic_frame)
-        cells = parse_cell_response(cell_frame)
+        try:
+            basic = parse_basic_response(basic_frame)
+            cells = parse_cell_response(cell_frame)
+        except BergerProtocolError:
+            LOG.warning("Ungültiger Berger-Frame empfangen", exc_info=True)
+            raise
         minimum = min(cells) if cells else None
         maximum = max(cells) if cells else None
-        self.snapshot_received.emit(
-            BatterySnapshot(
-                timestamp=datetime.now(timezone.utc),
-                device_name=self._config.name,
-                address=device.address,
-                rssi=self._rssi,
-                voltage=basic.voltage,
-                current=basic.current,
-                remaining_capacity_ah=basic.remaining_capacity_ah,
-                nominal_capacity_ah=basic.nominal_capacity_ah,
-                state_of_charge_percent=basic.state_of_charge_percent,
-                cycle_count=basic.cycle_count,
-                production_date=basic.production_date,
-                software_version=basic.software_version,
-                protection_status=basic.protection_status,
-                charge_mosfet_enabled=basic.charge_mosfet_enabled,
-                discharge_mosfet_enabled=basic.discharge_mosfet_enabled,
-                cell_count=basic.cell_count,
-                temperatures_celsius=basic.temperatures_celsius,
-                cell_voltages=cells,
-                minimum_cell_voltage=minimum,
-                maximum_cell_voltage=maximum,
-                cell_delta=(
-                    maximum - minimum
-                    if minimum is not None and maximum is not None
-                    else None
-                ),
-                raw_basic_response=basic_frame,
-                raw_cell_response=cell_frame,
-            )
+        snapshot = BatterySnapshot(
+            timestamp=datetime.now(timezone.utc),
+            device_name=self._config.name,
+            address=device.address,
+            rssi=self._rssi,
+            voltage=basic.voltage,
+            current=basic.current,
+            remaining_capacity_ah=basic.remaining_capacity_ah,
+            nominal_capacity_ah=basic.nominal_capacity_ah,
+            state_of_charge_percent=basic.state_of_charge_percent,
+            cycle_count=basic.cycle_count,
+            production_date=basic.production_date,
+            software_version=basic.software_version,
+            protection_status=basic.protection_status,
+            charge_mosfet_enabled=basic.charge_mosfet_enabled,
+            discharge_mosfet_enabled=basic.discharge_mosfet_enabled,
+            cell_count=basic.cell_count,
+            temperatures_celsius=basic.temperatures_celsius,
+            cell_voltages=cells,
+            minimum_cell_voltage=minimum,
+            maximum_cell_voltage=maximum,
+            cell_delta=(
+                maximum - minimum
+                if minimum is not None and maximum is not None
+                else None
+            ),
+            raw_basic_response=basic_frame,
+            raw_cell_response=cell_frame,
         )
+        LOG.info(
+            "Berger-Snapshot erfolgreich: Spannung %.2f V, Strom %.2f A, SOC %d %%",
+            snapshot.voltage,
+            snapshot.current,
+            snapshot.state_of_charge_percent,
+        )
+        self.snapshot_received.emit(snapshot)
 
     def _notification(self, _characteristic: Any, data: bytearray) -> None:
         self.target_activity.emit()
@@ -668,11 +688,17 @@ class BergerWorker(QThread):
                 f"Berger-Schreibzugriff 0x{register:02X}",
             )
             LOG.info("Berger 0x%02X gesendet", register)
-            frame = await self._operation_or_stop(
-                response,
-                REQUEST_TIMEOUT,
-                f"Berger-Antwort 0x{register:02X}",
-            )
+            try:
+                frame = await self._operation_or_stop(
+                    response,
+                    REQUEST_TIMEOUT,
+                    f"Berger-Antwort 0x{register:02X}",
+                )
+            except TimeoutError:
+                LOG.warning(
+                    "Berger-Notification-Timeout nach Request 0x%02X", register
+                )
+                raise
             LOG.info("Berger 0x%02X Antwort empfangen", register)
             return frame
         finally:

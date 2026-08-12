@@ -59,6 +59,7 @@ class BleCoordinator(QObject):
         self._active_history_serial = 0
         self._settled_history_mode = BleMode.HISTORY_READY
         self._berger_restore_waiting = False
+        LOG.info("BLE-Modus: STATUS")
 
         victron_worker.scan_mode_changed.connect(self._on_scan_mode_changed)
         victron_worker.scan_paused.connect(self._on_scan_paused)
@@ -204,6 +205,7 @@ class BleCoordinator(QObject):
         LOG.info("BLE-Transition beendet: %s", self._mode.value)
 
     def _start_scan_resume(self) -> None:
+        LOG.info("BLE-Transition gestartet: %s -> STATUS", self._mode.value)
         self._transition = _Transition.RESUMING_STATUS_SCAN
         self._victron.request_exclusive_resume()
 
