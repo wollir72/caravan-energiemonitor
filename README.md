@@ -1,4 +1,4 @@
-# Caravan-Energiemonitor 0.1
+# Caravan-Energiemonitor 0.2.0
 
 Native Linux-Desktop-Anwendung für den Victron SmartSolar MPPT 100/20 und die
 Berger LiFePO4 Lithium Batterie Pro 12,8 V / 200 Ah. Victron wird passiv über
