@@ -122,9 +122,14 @@ internes Scanner-Lebenszeichen. Fehlt dieses, wird ein ausgefallener Worker als
 Die Tests benötigen weder Bluetooth-Hardware noch BlueZ:
 
 ```bash
-python -m pytest -v
-python -m compileall src
+./venv-python -m pytest -v
+./venv-python -m compileall src
 ```
+
+Der Wrapper verwendet standardmäßig
+`~/bin/venvs/caravan-energiemonitor/bin/python`; das venv muss nicht manuell
+aktiviert werden. Mit `CARAVAN_PYTHON` kann ein anderer Interpreter gewählt
+werden.
 
 ## Bekannte Einschränkungen
 

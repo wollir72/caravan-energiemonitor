@@ -1,0 +1,12 @@
+#!/bin/sh
+
+PYTHON="${CARAVAN_PYTHON:-$HOME/bin/venvs/caravan-energiemonitor/bin/python}"
+
+if [ ! -x "$PYTHON" ]; then
+    echo "Fehler: Python-Interpreter nicht gefunden oder nicht ausführbar: $PYTHON" >&2
+    echo "Erwartetes venv: \$HOME/bin/venvs/caravan-energiemonitor" >&2
+    echo "Alternativ CARAVAN_PYTHON auf einen passenden Interpreter setzen." >&2
+    exit 127
+fi
+
+exec "$PYTHON" "$@"
