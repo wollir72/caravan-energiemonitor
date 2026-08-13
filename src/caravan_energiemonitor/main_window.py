@@ -5,7 +5,7 @@ import time
 from datetime import datetime
 
 from PySide6.QtCore import QThread, QTimer, Qt
-from PySide6.QtGui import QCloseEvent, QColor, QPalette
+from PySide6.QtGui import QCloseEvent, QColor, QPalette, QResizeEvent
 from PySide6.QtWidgets import (
     QFrame,
     QGridLayout,
@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
 )
 
 from .config import AppConfig
+from . import __version__
 from .ble_coordinator import BleCoordinator, BleMode
 from caravan_energiemonitor.devices.berger.worker import BergerWorker
 from caravan_energiemonitor.devices.victron.worker import VictronWorker
@@ -191,7 +192,31 @@ class MainWindow(QMainWindow):
         columns.addWidget(self._victron_column(), 9)
         columns.addWidget(self._berger_column(), 11)
         outer.addLayout(columns, 1)
+        self.version_label = QLabel(f"v{__version__}", root)
+        version_font = self.version_label.font()
+        version_font.setPointSize(max(7, version_font.pointSize() - 1))
+        self.version_label.setFont(version_font)
+        self.version_label.setAlignment(Qt.AlignmentFlag.AlignRight)
+        self.version_label.setAttribute(
+            Qt.WidgetAttribute.WA_TransparentForMouseEvents
+        )
+        self.version_label.adjustSize()
+        self._position_version_label(root.size().width(), root.size().height())
+        self.version_label.raise_()
         self.setCentralWidget(root)
+
+    def _position_version_label(self, width: int, height: int) -> None:
+        """Place the version inside the existing lower/right content margins."""
+        self.version_label.move(
+            max(0, width - 18 - self.version_label.width()),
+            max(0, height - 2 - self.version_label.height()),
+        )
+
+    def resizeEvent(self, event: QResizeEvent) -> None:
+        super().resizeEvent(event)
+        if hasattr(self, "version_label"):
+            size = event.size()
+            self._position_version_label(size.width(), size.height())
 
     def _device_header(self, name: str, status: QLabel) -> QWidget:
         header = QWidget()

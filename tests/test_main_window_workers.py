@@ -348,3 +348,7 @@ def test_victron_tabs_and_history_viewport_use_window_background(window):
     assert window.history_view.table.viewport().palette().color(
         QPalette.ColorRole.Base
     ) == expected
+
+
+def test_version_label_uses_central_version(window):
+    assert window.version_label.text() == "v0.2.1"

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "caravan-energiemonitor"
-version = "0.2.0"
+dynamic = ["version"]
 description = "Native Linux monitor for Victron solar and a Berger LiFePO4 battery"
 readme = "README.md"
 requires-python = ">=3.13,<3.14"
@@ -19,6 +19,9 @@ caravan-energiemonitor = "caravan_energiemonitor.app:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.dynamic]
+version = {attr = "caravan_energiemonitor.__version__"}
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

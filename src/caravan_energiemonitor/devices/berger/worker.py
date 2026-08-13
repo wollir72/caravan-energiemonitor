@@ -83,12 +83,35 @@ class BergerWorker(QThread):
         self._normal_operation_permission: asyncio.Event | None = None
         self._normal_resume_pending = threading.Event()
         self._assembler = FrameAssembler()
-        self._responses: dict[int, asyncio.Future[bytes]] = {}
+        self._response_future: asyncio.Future[bytes] | None = None
+        self._expected_register: int | None = None
+        self._rx_session = 0
         self._rssi: int | None = None
         self._initial_attempt_reported = False
         self._connected_in_attempt = False
         self._snapshot_received_in_attempt = False
         self._connection_attempt = 0
+
+    def _reset_rx_state(self, reason: str) -> None:
+        """Discard only pending Berger request/notification receive state."""
+        response = self._response_future
+        if response is not None and not response.done():
+            response.cancel()
+        self._response_future = None
+        self._expected_register = None
+        self._assembler.clear()
+        LOG.debug("Berger-RX-State verworfen: %s", reason)
+
+    def _begin_rx_session(self) -> int:
+        """Invalidate callbacks from older clients and start with empty RX state."""
+        self._rx_session += 1
+        self._reset_rx_state("vor neuer GATT-Session")
+        return self._rx_session
+
+    def _end_rx_session(self, reason: str) -> None:
+        """Invalidate the current client's callback and discard its RX state."""
+        self._rx_session += 1
+        self._reset_rx_state(reason)
 
     def _set_async_event(self, event: asyncio.Event | None) -> None:
         loop = self._loop
@@ -141,9 +164,14 @@ class BergerWorker(QThread):
         stop = self._async_stop
         if loop is not None and stop is not None:
             try:
+                loop.call_soon_threadsafe(
+                    self._end_rx_session, "Worker-Shutdown"
+                )
                 loop.call_soon_threadsafe(stop.set)
             except RuntimeError:
                 pass  # The worker completed between reading and using the loop.
+        else:
+            self._end_rx_session("Worker-Shutdown ohne aktiven Event-Loop")
 
     def run(self) -> None:
         LOG.info("Berger-Worker gestartet (%s)", self._config.address)
@@ -162,6 +190,7 @@ class BergerWorker(QThread):
             LOG.exception("Berger-Worker endgültig abgebrochen: %s", message)
             self.bluetooth_error.emit(message)
         finally:
+            self._end_rx_session("Worker beendet")
             self._report_initial_attempt_finished()
             pending = asyncio.all_tasks(loop)
             for task in pending:
@@ -453,13 +482,15 @@ class BergerWorker(QThread):
     async def _connected_session(self, device) -> None:
         disconnected = asyncio.Event()
         disconnect_expected = False
+        rx_session = self._begin_rx_session()
 
         def on_disconnect(_client) -> None:
             if not disconnect_expected:
                 LOG.warning("Berger-Verbindung verloren (%s)", device.address)
+            if rx_session == self._rx_session:
+                self._end_rx_session("GATT-Disconnect")
             disconnected.set()
 
-        self._assembler.clear()
         client = BleakClient(
             device,
             disconnected_callback=on_disconnect,
@@ -478,6 +509,7 @@ class BergerWorker(QThread):
             if not client.is_connected:
                 raise ConnectionError("Berger-Verbindung wurde nicht hergestellt.")
             connected = True
+            self._reset_rx_state("nach erfolgreichem Connect")
             self._connected_in_attempt = True
             self.connection_state_changed.emit(True)
             LOG.info("Berger-Verbindung hergestellt (%s)", device.address)
@@ -489,11 +521,19 @@ class BergerWorker(QThread):
             self._report_initial_attempt_finished()
 
             await self._operation_or_stop(
-                client.start_notify(NOTIFY_UUID, self._notification),
+                client.start_notify(
+                    NOTIFY_UUID,
+                    lambda characteristic, data: self._notification(
+                        rx_session, characteristic, data
+                    ),
+                ),
                 CONNECT_TIMEOUT,
                 "Start der Berger-Notifications",
             )
             notifications_started = True
+            self._reset_rx_state("nach start_notify")
+            if self._connection_attempt > 1:
+                LOG.info("Berger-RX-State nach Reconnect neu initialisiert")
             if not await self._normal_operation_barrier():
                 raise _HistoryPauseRequested
 
@@ -511,6 +551,7 @@ class BergerWorker(QThread):
                 except _StopRequested:
                     raise
                 except (TimeoutError, BergerProtocolError) as exc:
+                    self._reset_rx_state("Messfensterfehler")
                     failed_measurement_windows += 1
                     LOG.warning(
                         "Berger-Messfenster fehlgeschlagen (%d/%d): %s",
@@ -550,10 +591,8 @@ class BergerWorker(QThread):
         finally:
             if connected:
                 self.connection_state_changed.emit(False)
-            for future in self._responses.values():
-                if not future.done():
-                    future.cancel()
-            self._responses.clear()
+            if rx_session == self._rx_session:
+                self._end_rx_session("verbundene Session verlassen")
             if notifications_started and client.is_connected:
                 await self._bounded_cleanup(
                     client.stop_notify(NOTIFY_UUID), "Berger-Notifications stoppen"
@@ -614,6 +653,14 @@ class BergerWorker(QThread):
         try:
             return await self._request(client, register, command)
         except TimeoutError:
+            self._reset_rx_state(
+                f"Notification-Timeout vor Retry 0x{register:02X}"
+            )
+            LOG.warning(
+                "RX-State nach Notification-Timeout verworfen; "
+                "Retry 0x%02X mit neuem Response-State",
+                register,
+            )
             LOG.warning(
                 "Wiederholung einer einzelnen Berger-Abfrage 0x%02X", register
             )
@@ -622,9 +669,15 @@ class BergerWorker(QThread):
     def _emit_snapshot(self, device, basic_frame: bytes, cell_frame: bytes) -> None:
         try:
             basic = parse_basic_response(basic_frame)
+        except BergerProtocolError as exc:
+            self._log_invalid_frame(basic_frame, BASIC_REGISTER, exc)
+            self._reset_rx_state("Parser-/Framefehler")
+            raise
+        try:
             cells = parse_cell_response(cell_frame)
-        except BergerProtocolError:
-            LOG.warning("Ungültiger Berger-Frame empfangen", exc_info=True)
+        except BergerProtocolError as exc:
+            self._log_invalid_frame(cell_frame, CELL_REGISTER, exc)
+            self._reset_rx_state("Parser-/Framefehler")
             raise
         minimum = min(cells) if cells else None
         maximum = max(cells) if cells else None
@@ -665,14 +718,57 @@ class BergerWorker(QThread):
         )
         self.snapshot_received.emit(snapshot)
 
-    def _notification(self, _characteristic: Any, data: bytearray) -> None:
+    @staticmethod
+    def _format_raw_frame(frame: bytes, limit: int = 128) -> str:
+        shown = frame[:limit]
+        suffix = " ..." if len(frame) > limit else ""
+        return shown.hex(" ").upper() + suffix
+
+    def _log_invalid_frame(
+        self, frame: bytes, expected_register: int, error: BergerProtocolError
+    ) -> None:
+        actual = f"0x{frame[1]:02X}" if len(frame) > 1 else "unbekannt"
+        LOG.warning(
+            "Berger-Frame ungültig: %s; Länge=%d; erwartet=0x%02X; "
+            "tatsächlich=%s; Fehler=%s",
+            self._format_raw_frame(frame),
+            len(frame),
+            expected_register,
+            actual,
+            error,
+        )
+
+    def _notification(
+        self, rx_session: int, _characteristic: Any, data: bytearray
+    ) -> None:
+        if rx_session != self._rx_session:
+            LOG.debug("Veraltete Berger-Notification aus alter Session verworfen")
+            return
         self.target_activity.emit()
         for frame in self._assembler.feed(data):
             if len(frame) < 2:
                 continue
-            future = self._responses.get(frame[1])
-            if future is not None and not future.done():
-                future.set_result(frame)
+            actual_register = frame[1]
+            future = self._response_future
+            if (
+                future is None
+                or future.done()
+                or self._expected_register != actual_register
+            ):
+                LOG.debug(
+                    "Unerwartete Berger-Notification verworfen: %s; Länge=%d; "
+                    "erwartet=%s; tatsächlich=0x%02X",
+                    self._format_raw_frame(frame),
+                    len(frame),
+                    (
+                        f"0x{self._expected_register:02X}"
+                        if self._expected_register is not None
+                        else "keine"
+                    ),
+                    actual_register,
+                )
+                continue
+            future.set_result(frame)
 
     async def _request(self, client, register: int, command: bytes) -> bytes:
         """Send one of the two allow-listed read queries and await its response."""
@@ -680,7 +776,10 @@ class BergerWorker(QThread):
             raise BergerProtocolError("Nicht erlaubter Berger-Befehl.")
         loop = asyncio.get_running_loop()
         response: asyncio.Future[bytes] = loop.create_future()
-        self._responses[register] = response
+        if self._response_future is not None:
+            raise BergerProtocolError("Berger-Abfrage bereits aktiv.")
+        self._expected_register = register
+        self._response_future = response
         try:
             await self._operation_or_stop(
                 client.write_gatt_char(WRITE_UUID, command, response=False),
@@ -698,8 +797,13 @@ class BergerWorker(QThread):
                 LOG.warning(
                     "Berger-Notification-Timeout nach Request 0x%02X", register
                 )
+                if self._response_future is response:
+                    self._reset_rx_state(
+                        f"Notification-Timeout 0x{register:02X}"
+                    )
                 raise
             LOG.info("Berger 0x%02X Antwort empfangen", register)
             return frame
         finally:
-            self._responses.pop(register, None)
+            if self._response_future is response:
+                self._reset_rx_state(f"Request 0x{register:02X} beendet")
